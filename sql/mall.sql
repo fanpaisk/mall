@@ -50,7 +50,7 @@ DROP TABLE IF EXISTS `mall_user`;
 CREATE TABLE `mall_user` (
   `id`          int          NOT NULL AUTO_INCREMENT                COMMENT '用户表主键，自增',
   `username`    varchar(50)  NOT NULL                               COMMENT '用户名，唯一（UserMapper.countByUsername 依赖）',
-  `password`    varchar(50)  NOT NULL                               COMMENT '密码密文（MD5 为 32 位；若改用 BCrypt 需自行加长此列）',
+  `password`    varchar(100) NOT NULL                               COMMENT '密码密文：BCrypt 固定 60 字符（$2a$10$ + 22 位盐 + 31 位摘要）；历史数据为 32 位 MD5，登录成功后自动升级，见 sql/upgrade-20261116-password-column.sql',
   `email`       varchar(50)  DEFAULT NULL                           COMMENT '电子邮箱，注册时不可重复（countByEmail 校验）',
   `phone`       varchar(20)  DEFAULT NULL                           COMMENT '手机号',
   `question`    varchar(100) DEFAULT NULL                           COMMENT '找回密码用的密保问题',
