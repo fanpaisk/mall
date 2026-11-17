@@ -9,6 +9,7 @@ import com.imooc.mall.dao.ShippingMapper;
 import com.imooc.mall.enums.OrderStatusEnum;
 import com.imooc.mall.enums.ProductStatusEnum;
 import com.imooc.mall.enums.ResponseEnum;
+import com.imooc.mall.exception.BizException;
 import com.imooc.mall.pojo.*;
 import com.imooc.mall.service.ICartService;
 import com.imooc.mall.service.IOrderService;
@@ -19,13 +20,17 @@ import org.springframework.beans.BeanUtils;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionSynchronization;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
 import org.springframework.util.CollectionUtils;
+import lombok.extern.slf4j.Slf4j;
 
 import java.math.BigDecimal;
 import java.util.*;
 import java.util.stream.Collectors;
 
 @Service
+@Slf4j
 public class OrderServiceImpl implements IOrderService {
     @Autowired
     private ShippingMapper shippingMapper;
@@ -45,7 +50,7 @@ public class OrderServiceImpl implements IOrderService {
         ///收货地址校验（总之要查出来）
         Shipping shipping = shippingMapper.selectByUidAndShippingId(uid, shippingId);
         if (shipping == null) {
-            return ResponseVo.error(ResponseEnum.SHIPPING_NOT_EXIST);
+            throw new BizException(ResponseEnum.SHIPPING_NOT_EXIST, "收货地址不存在");
         }
         ///获取购物车，校验（是否有商品，库存）
         List<Cart> cartList = cartService.listForCart(uid)
@@ -53,7 +58,7 @@ public class OrderServiceImpl implements IOrderService {
                 .filter(Cart::getProductSelected)
                 .collect(Collectors.toList());
         if (CollectionUtils.isEmpty(cartList)) {
-            return ResponseVo.error(ResponseEnum.CART_SELECTED_IS_EMPTY);
+            throw new BizException(ResponseEnum.CART_SELECTED_IS_EMPTY, "请选择商品后下单");
         }
         //获取cartList里的products
         Set<Integer> productIdSet = cartList
@@ -72,27 +77,26 @@ public class OrderServiceImpl implements IOrderService {
             Product product = map.get(cart.getProductId());
 //            是否有商品
             if (product == null) {
-                return ResponseVo.error(ResponseEnum.PRODUCT_NOT_EXIST
-                        , "商品不存在.productId=" + cart.getProductId());
+                throw new BizException(ResponseEnum.PRODUCT_NOT_EXIST,
+                        "商品不存在.productId=" + cart.getProductId());
             }
             //商品的上下架状态
             if (!ProductStatusEnum.ON_SALE.getCode().equals(product.getStatus())) {
-                return ResponseVo.error(ResponseEnum.PRODUCT_OFF_SALE_OR_DELETE
-                        , "商品不是在售状态." + product.getName());
-
+                throw new BizException(ResponseEnum.PRODUCT_OFF_SALE_OR_DELETE,
+                        "商品不是在售状态." + product.getName());
             }
-//            库存是否充足
+            //库存是否充足（先快速失败；最终以条件更新的 affected rows 为准）
             if (product.getStock() < cart.getQuantity()) {
-                return ResponseVo.error(ResponseEnum.PRODUCT_STOCK_ERROR
-                        , "库存不足." + product.getName());
+                throw new BizException(ResponseEnum.PRODUCT_STOCK_ERROR,
+                        "库存不足." + product.getName());
             }
             OrderItem orderItem = buildOrderItem(cart.getQuantity(), product, uid, orderNo);
             orderItemList.add(orderItem);
-            //减库存
-            product.setStock(product.getStock() - cart.getQuantity());
-            int row = productMapper.updateByPrimaryKeySelective(product);
+            //减库存：条件更新，一条 SQL 同时完成“检查够不够”和“扣减”，并发不会超卖
+            int row = productMapper.decreaseStock(product.getId(), cart.getQuantity());
             if (row <= 0) {
-                return ResponseVo.error(ResponseEnum.ERROR);
+                throw new BizException(ResponseEnum.PRODUCT_STOCK_ERROR,
+                        "库存不足（并发扣减失败）." + product.getName());
             }
         }
         ///计算总价，计算选中商品
@@ -101,18 +105,29 @@ public class OrderServiceImpl implements IOrderService {
 
         int rowForOrder = orderMapper.insertSelective(order);
         if (rowForOrder <= 0) {
-            return ResponseVo.error(ResponseEnum.ERROR);
+            throw new BizException(ResponseEnum.ERROR, "创建订单失败");
         }
         int rowForOrderItem = orderItemMapper.batchInsert(orderItemList);
         if (rowForOrderItem <= 0) {
-            return ResponseVo.error(ResponseEnum.ERROR);
+            throw new BizException(ResponseEnum.ERROR, "创建订单明细失败");
         }
         //更新购物车（选中的商品删掉）
-        //redis也有事务（打包命令），和mysql不一样不能回滚
-        /// 不写在上面的循环里，是为了保证上面的操作都成功
-        for (Cart cart : cartList) {
-            cartService.delete(uid, cart.getProductId());
-        }
+        //Redis 不受数据库事务管理：必须在事务提交成功后再删，否则回滚了购物车却已经被清空
+        final List<Integer> orderedProductIds = cartList.stream()
+                .map(Cart::getProductId)
+                .collect(Collectors.toList());
+        TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+            @Override
+            public void afterCommit() {
+                for (Integer productId : orderedProductIds) {
+                    try {
+                        cartService.delete(uid, productId);
+                    } catch (Exception e) {
+                        log.warn("订单已创建，但清购物车失败 productId={}", productId, e);
+                    }
+                }
+            }
+        });
 
         //构造orderVo
         OrderVo orderVo = buildOrderVo(order, orderItemList, shipping);

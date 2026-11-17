@@ -188,6 +188,13 @@
     </if>
   </select>
 
+  <update id="decreaseStock">
+    update mall_product
+    set stock = stock - #{quantity,jdbcType=INTEGER}
+    where id = #{id,jdbcType=INTEGER}
+      and stock &gt;= #{quantity,jdbcType=INTEGER}
+  </update>
+
   <select id="selectByProductIdList" resultMap="BaseResultMap">
     SELECT
     <include refid="Base_Column_List" />

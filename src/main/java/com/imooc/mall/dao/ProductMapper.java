@@ -25,4 +25,7 @@ public interface ProductMapper {
 
     List<Product> selectByProductIdList(@Param("productIdList") List<Integer> productIdList);
 
+    /** 条件扣库存：库存够才扣，返回受影响行数（0 = 库存不足，并发安全） */
+    int decreaseStock(@Param("id") Integer id, @Param("quantity") Integer quantity);
+
 }
